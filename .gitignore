@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# CMake and build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+Makefile
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Local databases and temporary files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
