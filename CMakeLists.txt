@@ -13,6 +13,8 @@ find_package(pybind11 CONFIG REQUIRED)
 
 add_executable(VLEStudio
     src/main.cpp
+    src/diagram_widget.cpp
+    src/diagram_widget.h
 )
 
 target_link_libraries(VLEStudio PRIVATE
