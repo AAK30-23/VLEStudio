@@ -27,6 +27,9 @@
 #include <QTextStream>
 #include <QStringConverter>
 #include <QScrollArea>
+#include <QSignalBlocker>
+
+#include <algorithm>
 
 #include <pybind11/embed.h>
 #include <pybind11/stl.h>
@@ -38,6 +41,8 @@ namespace py = pybind11;
 
 // Результат расчёта
 struct CalculationResult {
+    QString mixture = "ETHANOL_WATER";
+    QString modelCode = "PR";
     QString model;
 
     double temperature = 0.0;
@@ -59,6 +64,69 @@ struct CalculationResult {
     bool hasVaporFraction = false;
     double vaporFraction = 0.0;
 };
+
+// Результат расчёта диаграммы T-x-y или P-x-y
+struct DiagramResult {
+    QString kind;       // TXY или PXY
+    QString mixture;
+    QString model;
+
+    double pressure = 0.0;     // для T-x-y
+    double temperature = 0.0;  // для P-x-y
+
+    QVector<double> x1;
+    QVector<double> y1;
+    QVector<double> values;    // температура или давление
+
+    bool hasAzeotrope = false;
+    double azeotropeX1 = 0.0;
+    double azeotropeValue = 0.0;
+};
+
+QString mixtureDisplayName(const QString &mixture)
+{
+    if (mixture == "ACETONE_CHLOROFORM") {
+        return "Ацетон – хлороформ";
+    }
+
+    return "Этанол – вода";
+}
+
+QString firstComponentName(const QString &mixture)
+{
+    if (mixture == "ACETONE_CHLOROFORM") {
+        return "ацетон";
+    }
+
+    return "этанол";
+}
+
+QString secondComponentName(const QString &mixture)
+{
+    if (mixture == "ACETONE_CHLOROFORM") {
+        return "хлороформ";
+    }
+
+    return "вода";
+}
+
+QString modelDisplayName(const QString &model)
+{
+    if (model == "UNIFAC_PR") {
+        return "UNIFAC + Peng–Robinson (gamma–phi)";
+    }
+
+    return "Peng–Robinson (phi–phi)";
+}
+
+QString diagramKindName(const QString &kind)
+{
+    if (kind == "PXY") {
+        return "P–x–y";
+    }
+
+    return "T–x–y";
+}
 
 // Элемент таблицы с корректной сортировкой чисел
 class SortableTableWidgetItem : public QTableWidgetItem {
@@ -136,6 +204,50 @@ bool createDatabaseTable(QSqlDatabase &db)
         return false;
     }
 
+    // Таблицы для сохранения диаграмм T–x–y и P–x–y
+    if (!query.exec(R"(
+        CREATE TABLE IF NOT EXISTS diagrams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT
+                (datetime('now', 'localtime')),
+            kind TEXT NOT NULL,
+            mixture TEXT NOT NULL,
+            model TEXT NOT NULL,
+            pressure_Pa REAL,
+            temperature_K REAL,
+            point_count INTEGER NOT NULL,
+            azeotrope_x1 REAL,
+            azeotrope_temperature_K REAL,
+            azeotrope_pressure_Pa REAL
+        )
+    )")) {
+        return false;
+    }
+
+    if (!query.exec(R"(
+        CREATE TABLE IF NOT EXISTS diagram_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            diagram_id INTEGER NOT NULL,
+            x1 REAL NOT NULL,
+            y1 REAL NOT NULL,
+            temperature_K REAL,
+            pressure_Pa REAL
+        )
+    )")) {
+        return false;
+    }
+
+    // Миграция базы, созданной предыдущими версиями приложения.
+    // Ошибка "duplicate column name" означает, что столбец уже есть.
+    query.exec(
+        "ALTER TABLE calculations ADD COLUMN mixture TEXT NOT NULL "
+        "DEFAULT 'ETHANOL_WATER'"
+    );
+    query.exec(
+        "ALTER TABLE calculations ADD COLUMN model_code TEXT NOT NULL "
+        "DEFAULT 'PR'"
+    );
+
     return true;
 }
 
@@ -151,6 +263,8 @@ bool saveCalculation(
     query.prepare(R"(
         INSERT INTO calculations (
             model,
+            model_code,
+            mixture,
             temperature_K,
             pressure_Pa,
             feed_ethanol,
@@ -164,6 +278,8 @@ bool saveCalculation(
         )
         VALUES (
             :model,
+            :model_code,
+            :mixture,
             :temperature,
             :pressure,
             :feed_ethanol,
@@ -178,6 +294,8 @@ bool saveCalculation(
     )");
 
     query.bindValue(":model", result.model);
+    query.bindValue(":model_code", result.modelCode);
+    query.bindValue(":mixture", result.mixture);
     query.bindValue(":temperature", result.temperature);
 query.bindValue(":pressure",
 
@@ -210,6 +328,138 @@ result.pressure);
 
     if (!query.exec()) {
         errorMessage = query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// Сохранение диаграммы
+bool saveDiagram(
+    QSqlDatabase &db,
+    const DiagramResult &result,
+    QString &errorMessage
+)
+{
+    if (!db.transaction()) {
+        errorMessage = db.lastError().text();
+        return false;
+    }
+
+    QSqlQuery query(db);
+
+    query.prepare(R"(
+        INSERT INTO diagrams (
+            kind,
+            mixture,
+            model,
+            pressure_Pa,
+            temperature_K,
+            point_count,
+            azeotrope_x1,
+            azeotrope_temperature_K,
+            azeotrope_pressure_Pa
+        )
+        VALUES (
+            :kind,
+            :mixture,
+            :model,
+            :pressure,
+            :temperature,
+            :point_count,
+            :azeotrope_x1,
+            :azeotrope_temperature,
+            :azeotrope_pressure
+        )
+    )");
+
+    query.bindValue(":kind", result.kind);
+    query.bindValue(":mixture", result.mixture);
+    query.bindValue(":model", result.model);
+    query.bindValue(
+        ":pressure",
+        result.kind == "TXY" ? QVariant(result.pressure) : QVariant()
+    );
+    query.bindValue(
+        ":temperature",
+        result.kind == "PXY" ? QVariant(result.temperature) : QVariant()
+    );
+    query.bindValue(":point_count", result.x1.size());
+
+    if (result.hasAzeotrope) {
+        query.bindValue(":azeotrope_x1", result.azeotropeX1);
+        query.bindValue(
+            ":azeotrope_temperature",
+            result.kind == "TXY"
+                ? QVariant(result.azeotropeValue)
+                : QVariant()
+        );
+        query.bindValue(
+            ":azeotrope_pressure",
+            result.kind == "PXY"
+                ? QVariant(result.azeotropeValue)
+                : QVariant()
+        );
+    } else {
+        query.bindValue(":azeotrope_x1", QVariant());
+        query.bindValue(":azeotrope_temperature", QVariant());
+        query.bindValue(":azeotrope_pressure", QVariant());
+    }
+
+    if (!query.exec()) {
+        errorMessage = query.lastError().text();
+        db.rollback();
+        return false;
+    }
+
+    const int diagramId = query.lastInsertId().toInt();
+
+    QSqlQuery pointQuery(db);
+
+    pointQuery.prepare(R"(
+        INSERT INTO diagram_points (
+            diagram_id,
+            x1,
+            y1,
+            temperature_K,
+            pressure_Pa
+        )
+        VALUES (
+            :diagram_id,
+            :x1,
+            :y1,
+            :temperature,
+            :pressure
+        )
+    )");
+
+    for (int index = 0; index < result.x1.size(); ++index) {
+        pointQuery.bindValue(":diagram_id", diagramId);
+        pointQuery.bindValue(":x1", result.x1[index]);
+        pointQuery.bindValue(":y1", result.y1[index]);
+        pointQuery.bindValue(
+            ":temperature",
+            result.kind == "TXY"
+                ? QVariant(result.values[index])
+                : QVariant()
+        );
+        pointQuery.bindValue(
+            ":pressure",
+            result.kind == "PXY"
+                ? QVariant(result.values[index])
+                : QVariant()
+        );
+
+        if (!pointQuery.exec()) {
+            errorMessage = pointQuery.lastError().text();
+            db.rollback();
+            return false;
+        }
+    }
+
+    if (!db.commit()) {
+        errorMessage = db.lastError().text();
+        db.rollback();
         return false;
     }
 
@@ -256,7 +506,8 @@ void showCalculationDetails(
             liquid_water,
             vapor_ethanol,
             vapor_water,
-            vapor_fraction
+            vapor_fraction,
+            mixture
         FROM calculations
         WHERE id = :id
     )");
@@ -273,10 +524,15 @@ void showCalculationDetails(
         return;
     }
 
+    const QString mixture = query.value(13).toString();
+    const QString firstComponent = firstComponentName(mixture);
+    const QString secondComponent = secondComponentName(mixture);
+
     QStringList lines;
 
     lines << "ID расчёта: " + query.value(0).toString();
     lines << "Дата: " + query.value(1).toString();
+    lines << "Смесь: " + mixtureDisplayName(mixture);
     lines << "Модель: " + query.value(2).toString();
 
     lines << "";
@@ -291,10 +547,10 @@ void showCalculationDetails(
     lines << "";
     lines << "Исходный состав:";
 
-    lines << "Этанол: "
+    lines << firstComponent + ": "
         + displayDatabaseValue(query.value(5));
 
-    lines << "Вода: "
+    lines << secondComponent + ": "
         + displayDatabaseValue(query.value(6));
 
     lines << "";
@@ -307,9 +563,9 @@ void showCalculationDetails(
 
     if (!query.value(8).isNull()) {
         lines << "Жидкая фаза:";
-        lines << "Этанол: "
+        lines << firstComponent + ": "
             + displayDatabaseValue(query.value(8));
-        lines << "Вода: "
+        lines << secondComponent + ": "
             + displayDatabaseValue(query.value(9));
     } else {
         lines << "Жидкая фаза отсутствует.";
@@ -319,9 +575,9 @@ void showCalculationDetails(
 
     if (!query.value(10).isNull()) {
         lines << "Паровая фаза:";
-        lines << "Этанол: "
+        lines << firstComponent + ": "
             + displayDatabaseValue(query.value(10));
-        lines << "Вода: "
+        lines << secondComponent + ": "
             + displayDatabaseValue(query.value(11));
     } else {
         lines << "Паровая фаза отсутствует.";
@@ -423,7 +679,8 @@ void exportHistoryToCsv(
             liquid_water,
             vapor_ethanol,
             vapor_water,
-            vapor_fraction
+            vapor_fraction,
+            mixture
         FROM calculations
         ORDER BY id
     )")) {
@@ -455,16 +712,17 @@ void exportHistoryToCsv(
     QStringList headers = {
         "ID",
         "Дата",
+        "Смесь",
         "Модель",
         "Температура, K",
         "Давление, Pa",
-        "Этанол (исходный)",
-        "Вода (исходная)",
+        "Компонент 1 (исходный)",
+        "Компонент 2 (исходный)",
         "Количество фаз",
-        "Этанол (жидкость)",
-        "Вода (жидкость)",
-        "Этанол (пар)",
-        "Вода (пар)",
+        "Компонент 1 (жидкость)",
+        "Компонент 2 (жидкость)",
+        "Компонент 1 (пар)",
+        "Компонент 2 (пар)",
         "Доля пара"
     };
 
@@ -487,8 +745,12 @@ void exportHistoryToCsv(
     while (query.next()) {
         QStringList values;
 
-        for (int column = 0; column < 13; ++column) {
-            if (query.value(column).isNull()) {
+        for (int column = 0; column < 14; ++column) {
+            if (column == 2) {
+                values << mixtureDisplayName(
+                    query.value(column).toString()
+                );
+            } else if (query.value(column).isNull()) {
                 values << "";
             } else {
                 values << query.value(column).toString();
@@ -522,16 +784,17 @@ void showHistory(QSqlDatabase &db, QWidget *parent)
     QStringList headers = {
         "ID",
         "Дата",
+        "Смесь",
         "Модель",
         "T, K",
         "P, Pa",
-        "Этанол (исх.)",
-        "Вода (исх.)",
+        "Комп. 1 (исх.)",
+        "Комп. 2 (исх.)",
         "Фазы",
-        "Этанол (жидк.)",
-        "Вода (жидк.)",
-        "Этанол (пар)",
-        "Вода (пар)",
+        "Комп. 1 (жидк.)",
+        "Комп. 2 (жидк.)",
+        "Комп. 1 (пар)",
+        "Комп. 2 (пар)",
         "Доля пара"
     };
 
@@ -550,6 +813,7 @@ void showHistory(QSqlDatabase &db, QWidget *parent)
         SELECT
             id,
             created_at,
+            mixture,
             model,
             temperature_K,
             pressure_Pa,
@@ -584,14 +848,16 @@ void showHistory(QSqlDatabase &db, QWidget *parent)
 
             QString text;
 
-            if (value.isNull()) {
+            if (column == 2) {
+                text = mixtureDisplayName(value.toString());
+            } else if (value.isNull()) {
                 text = "—";
             } else {
                 text = value.toString();
             }
 
             bool numeric =
-                column == 0 || (column >= 3 && column <= 12);
+                column == 0 || (column >= 4 && column <= 13);
 
             auto *item = new SortableTableWidgetItem(
                 text,
@@ -754,6 +1020,574 @@ void showHistory(QSqlDatabase &db, QWidget *parent)
     dialog.exec();
 }
 
+// Запись диаграммы в CSV-файл
+bool writeDiagramCsv(
+    const QString &fileName,
+    const DiagramResult &diagram,
+    QString &errorMessage
+)
+{
+    QFile file(fileName);
+
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        errorMessage = file.errorString();
+        return false;
+    }
+
+    QTextStream stream(&file);
+    stream.setEncoding(QStringConverter::Utf8);
+
+    // BOM для корректного распознавания UTF-8 в Excel
+    stream << QChar(0xFEFF);
+
+    stream << "\"# Смесь: ";
+    stream << mixtureDisplayName(diagram.mixture);
+    stream << "; модель: ";
+    stream << modelDisplayName(diagram.model);
+    stream << "; вид: ";
+    stream << diagramKindName(diagram.kind);
+
+    if (diagram.kind == "TXY") {
+        stream << "; давление, Pa: " << QString::number(diagram.pressure, 'f', 0);
+    } else {
+        stream << "; температура, K: " << QString::number(diagram.temperature, 'f', 2);
+    }
+
+    if (diagram.hasAzeotrope) {
+        stream << "; азеотроп x1: " << QString::number(diagram.azeotropeX1, 'f', 5);
+
+        if (diagram.kind == "TXY") {
+            stream << "; азеотроп T, K: " << QString::number(diagram.azeotropeValue, 'f', 3);
+        } else {
+            stream << "; азеотроп P, Pa: " << QString::number(diagram.azeotropeValue, 'f', 0);
+        }
+    }
+
+    stream << "\"\n";
+
+    stream << "\"x1\";\"y1\";\"";
+    stream << (diagram.kind == "TXY" ? "Температура, K" : "Давление, Pa");
+    stream << "\"\n";
+
+    for (int index = 0; index < diagram.x1.size(); ++index) {
+        stream << QString::number(diagram.x1[index], 'f', 6) << ";"
+               << QString::number(diagram.y1[index], 'f', 6) << ";";
+
+        if (diagram.kind == "TXY") {
+            stream << QString::number(diagram.values[index], 'f', 3);
+        } else {
+            stream << QString::number(diagram.values[index], 'f', 1);
+        }
+
+        stream << "\n";
+    }
+
+    stream.flush();
+    file.close();
+
+    return true;
+}
+
+// Экспорт текущей диаграммы в CSV
+void exportDiagramToCsv(
+    const DiagramResult &diagram,
+    QWidget *parent
+)
+{
+    QString defaultName =
+        QDir::homePath()
+        + "/vle_"
+        + diagram.kind.toLower()
+        + "_"
+        + diagram.mixture.toLower()
+        + ".csv";
+
+    QString fileName = QFileDialog::getSaveFileName(
+        parent,
+        "Экспорт диаграммы",
+        defaultName,
+        "CSV-файлы (*.csv)"
+    );
+
+    if (fileName.isEmpty()) {
+        return;
+    }
+
+    if (!fileName.endsWith(".csv", Qt::CaseInsensitive)) {
+        fileName += ".csv";
+    }
+
+    QString errorMessage;
+
+    if (!writeDiagramCsv(fileName, diagram, errorMessage)) {
+        QMessageBox::critical(
+            parent,
+            "Ошибка экспорта",
+            "Не удалось создать файл:\n" + errorMessage
+        );
+        return;
+    }
+
+    QMessageBox::information(
+        parent,
+        "Экспорт завершён",
+        "Диаграмма сохранена:\n" + fileName
+    );
+}
+
+// Загрузка сохранённой диаграммы из базы
+bool loadDiagram(
+    QSqlDatabase &db,
+    int diagramId,
+    DiagramResult &diagram,
+    QString &errorMessage
+)
+{
+    QSqlQuery query(db);
+
+    query.prepare(R"(
+        SELECT
+            kind,
+            mixture,
+            model,
+            pressure_Pa,
+            temperature_K,
+            azeotrope_x1,
+            azeotrope_temperature_K,
+            azeotrope_pressure_Pa
+        FROM diagrams
+        WHERE id = :id
+    )");
+
+    query.bindValue(":id", diagramId);
+
+    if (!query.exec() || !query.next()) {
+        errorMessage = query.lastError().text();
+        return false;
+    }
+
+    diagram = DiagramResult{};
+
+    diagram.kind = query.value(0).toString();
+    diagram.mixture = query.value(1).toString();
+    diagram.model = query.value(2).toString();
+    diagram.pressure = query.value(3).toDouble();
+    diagram.temperature = query.value(4).toDouble();
+
+    if (!query.value(5).isNull()) {
+        diagram.hasAzeotrope = true;
+        diagram.azeotropeX1 = query.value(5).toDouble();
+
+        if (diagram.kind == "TXY") {
+            diagram.azeotropeValue = query.value(6).toDouble();
+        } else {
+            diagram.azeotropeValue = query.value(7).toDouble();
+        }
+    }
+
+    QSqlQuery pointsQuery(db);
+
+    pointsQuery.prepare(R"(
+        SELECT x1, y1, temperature_K, pressure_Pa
+        FROM diagram_points
+        WHERE diagram_id = :id
+        ORDER BY id
+    )");
+
+    pointsQuery.bindValue(":id", diagramId);
+
+    if (!pointsQuery.exec()) {
+        errorMessage = pointsQuery.lastError().text();
+        return false;
+    }
+
+    while (pointsQuery.next()) {
+        diagram.x1 << pointsQuery.value(0).toDouble();
+        diagram.y1 << pointsQuery.value(1).toDouble();
+
+        if (diagram.kind == "TXY") {
+            diagram.values << pointsQuery.value(2).toDouble();
+        } else {
+            diagram.values << pointsQuery.value(3).toDouble();
+        }
+    }
+
+    return true;
+}
+
+// Подробности сохранённой диаграммы
+void showDiagramDetails(
+    QSqlDatabase &db,
+    int diagramId,
+    QWidget *parent
+)
+{
+    DiagramResult diagram;
+    QString errorMessage;
+
+    if (!loadDiagram(db, diagramId, diagram, errorMessage)) {
+        QMessageBox::critical(
+            parent,
+            "Ошибка",
+            "Не удалось загрузить диаграмму:\n" + errorMessage
+        );
+        return;
+    }
+
+    QStringList lines;
+
+    lines << "ID диаграммы: " + QString::number(diagramId);
+    lines << "Вид: " + diagramKindName(diagram.kind);
+    lines << "Смесь: " + mixtureDisplayName(diagram.mixture);
+    lines << "Модель: " + modelDisplayName(diagram.model);
+
+    if (diagram.kind == "TXY") {
+        lines << "Давление: "
+            + QString::number(diagram.pressure, 'f', 0) + " Pa";
+    } else {
+        lines << "Температура: "
+            + QString::number(diagram.temperature, 'f', 2) + " K";
+    }
+
+    lines << "Количество точек: "
+        + QString::number(diagram.x1.size());
+
+    lines << "";
+
+    if (diagram.hasAzeotrope) {
+        lines << "Азеотропная точка:";
+        lines << "x1 = "
+            + QString::number(diagram.azeotropeX1, 'f', 5);
+
+        if (diagram.kind == "TXY") {
+            lines << "T = "
+                + QString::number(diagram.azeotropeValue, 'f', 3) + " K";
+        } else {
+            lines << "P = "
+                + QString::number(diagram.azeotropeValue, 'f', 0) + " Pa";
+        }
+    } else {
+        lines << "Азеотропная точка не найдена.";
+    }
+
+    if (!diagram.x1.isEmpty()) {
+        lines << "";
+        lines << "Первая точка: x1 = "
+            + QString::number(diagram.x1.first(), 'f', 4)
+            + ", y1 = "
+            + QString::number(diagram.y1.first(), 'f', 4);
+
+        lines << "Последняя точка: x1 = "
+            + QString::number(diagram.x1.last(), 'f', 4)
+            + ", y1 = "
+            + QString::number(diagram.y1.last(), 'f', 4);
+    }
+
+    QDialog dialog(parent);
+    dialog.setWindowTitle(
+        "Подробности диаграммы №" + QString::number(diagramId)
+    );
+    dialog.resize(450, 400);
+
+    auto *layout = new QVBoxLayout(&dialog);
+
+    auto *detailsLabel = new QLabel(lines.join("\n"));
+    detailsLabel->setTextInteractionFlags(
+        Qt::TextSelectableByMouse
+    );
+    detailsLabel->setWordWrap(true);
+
+    auto *closeButton = new QPushButton("Закрыть");
+
+    layout->addWidget(detailsLabel);
+    layout->addStretch();
+    layout->addWidget(closeButton);
+
+    QObject::connect(
+        closeButton,
+        &QPushButton::clicked,
+        &dialog,
+        &QDialog::accept
+    );
+
+    dialog.exec();
+}
+
+// История сохранённых диаграмм
+void showDiagramHistory(QSqlDatabase &db, QWidget *parent)
+{
+    QDialog dialog(parent);
+    dialog.setWindowTitle("История диаграмм");
+    dialog.resize(1150, 500);
+
+    auto *layout = new QVBoxLayout(&dialog);
+
+    auto *table = new QTableWidget(&dialog);
+
+    QStringList headers = {
+        "ID",
+        "Дата",
+        "Вид",
+        "Смесь",
+        "Модель",
+        "P, Pa",
+        "T, K",
+        "Точек",
+        "Азеотроп x1",
+        "Азеотроп T, K",
+        "Азеотроп P, Pa"
+    };
+
+    table->setColumnCount(headers.size());
+    table->setHorizontalHeaderLabels(headers);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setSortingEnabled(false);
+
+    QSqlQuery query(db);
+
+    if (!query.exec(R"(
+        SELECT
+            id,
+            created_at,
+            kind,
+            mixture,
+            model,
+            pressure_Pa,
+            temperature_K,
+            point_count,
+            azeotrope_x1,
+            azeotrope_temperature_K,
+            azeotrope_pressure_Pa
+        FROM diagrams
+        ORDER BY id DESC
+    )")) {
+        QMessageBox::critical(
+            &dialog,
+            "Ошибка",
+            "Не удалось загрузить историю диаграмм:\n"
+                + query.lastError().text()
+        );
+        return;
+    }
+
+    int row = 0;
+
+    while (query.next()) {
+        table->insertRow(row);
+
+        for (int column = 0; column < headers.size(); ++column) {
+            QVariant value = query.value(column);
+            QString text;
+
+            if (column == 2) {
+                text = diagramKindName(value.toString());
+            } else if (column == 3) {
+                text = mixtureDisplayName(value.toString());
+            } else if (column == 4) {
+                text = modelDisplayName(value.toString());
+            } else if (column == 5 && value.isNull()) {
+                text = "—";
+            } else if (column == 6 && value.isNull()) {
+                text = "—";
+            } else if (column == 8 && value.isNull()) {
+                text = "—";
+            } else if (column == 9 && value.isNull()) {
+                text = "—";
+            } else if (column == 10 && value.isNull()) {
+                text = "—";
+            } else if (value.isNull()) {
+                text = "—";
+            } else if (column == 8) {
+                text = QString::number(value.toDouble(), 'f', 5);
+            } else if (column == 9 || column == 10) {
+                text = QString::number(value.toDouble(), 'f', 5);
+            } else {
+                text = value.toString();
+            }
+
+            bool numeric = column == 0 || (column >= 5 && column <= 10);
+
+            auto *item = new SortableTableWidgetItem(
+                text,
+                value,
+                numeric
+            );
+
+            table->setItem(row, column, item);
+        }
+
+        ++row;
+    }
+
+    table->horizontalHeader()->setSectionResizeMode(
+        QHeaderView::ResizeToContents
+    );
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->setSortingEnabled(true);
+
+    layout->addWidget(table);
+
+    auto *buttonsLayout = new QHBoxLayout();
+
+    auto *detailsButton = new QPushButton("Подробности");
+    auto *exportButton = new QPushButton("Экспорт в CSV");
+    auto *deleteButton = new QPushButton("Удалить запись");
+    auto *closeButton = new QPushButton("Закрыть");
+
+    buttonsLayout->addWidget(detailsButton);
+    buttonsLayout->addWidget(exportButton);
+    buttonsLayout->addWidget(deleteButton);
+    buttonsLayout->addStretch();
+    buttonsLayout->addWidget(closeButton);
+
+    layout->addLayout(buttonsLayout);
+
+    auto selectedId = [table]() {
+        int currentRow = table->currentRow();
+
+        if (currentRow < 0) {
+            return -1;
+        }
+
+        QTableWidgetItem *item = table->item(currentRow, 0);
+
+        return item == nullptr ? -1 : item->text().toInt();
+    };
+
+    auto showDetails = [&]() {
+        int id = selectedId();
+
+        if (id < 0) {
+            QMessageBox::warning(
+                &dialog,
+                "Запись не выбрана",
+                "Сначала выберите диаграмму в таблице."
+            );
+            return;
+        }
+
+        showDiagramDetails(db, id, &dialog);
+    };
+
+    QObject::connect(
+        detailsButton,
+        &QPushButton::clicked,
+        &dialog,
+        showDetails
+    );
+
+    QObject::connect(
+        table,
+        &QTableWidget::cellDoubleClicked,
+        &dialog,
+        [showDetails](int, int) {
+            showDetails();
+        }
+    );
+
+    QObject::connect(
+        exportButton,
+        &QPushButton::clicked,
+        &dialog,
+        [&]() {
+            int id = selectedId();
+
+            if (id < 0) {
+                QMessageBox::warning(
+                    &dialog,
+                    "Запись не выбрана",
+                    "Сначала выберите диаграмму для экспорта."
+                );
+                return;
+            }
+
+            DiagramResult diagram;
+            QString errorMessage;
+
+            if (!loadDiagram(db, id, diagram, errorMessage)) {
+                QMessageBox::critical(
+                    &dialog,
+                    "Ошибка экспорта",
+                    "Не удалось загрузить диаграмму:\n"
+                        + errorMessage
+                );
+                return;
+            }
+
+            exportDiagramToCsv(diagram, &dialog);
+        }
+    );
+
+    QObject::connect(
+        deleteButton,
+        &QPushButton::clicked,
+        &dialog,
+        [&]() {
+            int id = selectedId();
+
+            if (id < 0) {
+                QMessageBox::warning(
+                    &dialog,
+                    "Запись не выбрана",
+                    "Сначала выберите диаграмму для удаления."
+                );
+                return;
+            }
+
+            auto answer = QMessageBox::question(
+                &dialog,
+                "Подтверждение удаления",
+                "Удалить диаграмму №" + QString::number(id) + "?",
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No
+            );
+
+            if (answer != QMessageBox::Yes) {
+                return;
+            }
+
+            QSqlQuery deletePoints(db);
+            deletePoints.prepare(
+                "DELETE FROM diagram_points WHERE diagram_id = :id"
+            );
+            deletePoints.bindValue(":id", id);
+            deletePoints.exec();
+
+            QSqlQuery deleteDiagram(db);
+            deleteDiagram.prepare(
+                "DELETE FROM diagrams WHERE id = :id"
+            );
+            deleteDiagram.bindValue(":id", id);
+
+            if (!deleteDiagram.exec()) {
+                QMessageBox::critical(
+                    &dialog,
+                    "Ошибка удаления",
+                    deleteDiagram.lastError().text()
+                );
+                return;
+            }
+
+            int currentRow = table->currentRow();
+
+            if (currentRow >= 0) {
+                table->removeRow(currentRow);
+            }
+        }
+    );
+
+    QObject::connect(
+        closeButton,
+        &QPushButton::clicked,
+        &dialog,
+        &QDialog::accept
+    );
+
+    dialog.exec();
+}
+
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
@@ -887,7 +1721,7 @@ int main(int argc, char *argv[])
         pressureMax->setRange(1000.0, 10000000.0);
         pressureMax->setDecimals(0);
         pressureMax->setSuffix(" Pa");
-        pressureMax->setValue(1000000.0);
+        pressureMax->setValue(250000.0);
 
         // Количество точек для построения диаграммы
         auto *pointCount = new QSpinBox();
@@ -942,7 +1776,13 @@ int main(int argc, char *argv[])
         // Кнопки
         auto *calculateButton = new QPushButton("Рассчитать");
         auto *saveButton = new QPushButton("Сохранить расчёт");
+        auto *exportDiagramButton =
+            new QPushButton("Экспорт диаграммы в CSV");
         auto *historyButton = new QPushButton("История расчётов");
+        auto *diagramHistoryButton =
+            new QPushButton("История диаграмм");
+
+        exportDiagramButton->setEnabled(false);
 
         // Поле результатов
         auto *resultLabel = new QLabel(
@@ -966,11 +1806,26 @@ int main(int argc, char *argv[])
         diagramWidget->setMinimumHeight(350);
 
         diagramWidget->clearDiagram(
-            "Выберите режим T–x–y или P–x–y.\n"
-            "Расчётные данные появятся после подключения расчётной функции."
+            "Выберите режим T–x–y или P–x–y и нажмите «Рассчитать»."
         );
 
         diagramLayout->addWidget(diagramWidget);
+
+        // Таблица расчётных точек диаграммы
+        auto *tableLabel = new QLabel("Расчётные точки диаграммы");
+
+        auto *resultTable = new QTableWidget();
+
+        resultTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        resultTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        resultTable->setAlternatingRowColors(true);
+        resultTable->setMinimumHeight(180);
+
+        tableLabel->hide();
+        resultTable->hide();
+
+        diagramLayout->addWidget(tableLabel);
+        diagramLayout->addWidget(resultTable);
 
         // Размещение элементов внутри прокручиваемого виджета
         layout->addWidget(title);
@@ -980,15 +1835,25 @@ int main(int argc, char *argv[])
 
         buttonsLayout->addWidget(calculateButton);
         buttonsLayout->addWidget(saveButton);
-        buttonsLayout->addWidget(historyButton);
+        buttonsLayout->addWidget(exportDiagramButton);
+
+        auto *buttonsLayout2 = new QHBoxLayout();
+
+        buttonsLayout2->addWidget(historyButton);
+        buttonsLayout2->addWidget(diagramHistoryButton);
+        buttonsLayout2->addStretch();
 
         layout->addLayout(buttonsLayout);
+        layout->addLayout(buttonsLayout2);
         layout->addWidget(resultLabel);
         layout->addWidget(diagramGroup, 1);
 
         // Последний расчёт
         CalculationResult lastResult;
         bool hasCalculation = false;
+
+        DiagramResult lastDiagram;
+        bool hasDiagram = false;
 
         // Обновление интерфейса при выборе режима и смеси
         auto updateCalculationInterface = [&]() {
@@ -1031,6 +1896,9 @@ int main(int argc, char *argv[])
             setFieldVisible(pressureMaxLabel, pressureMax, isPxy);
             setFieldVisible(pointCountLabel, pointCount, !isPoint);
 
+            modelCombo->setEnabled(true);
+            calculateButton->setEnabled(true);
+
             if (isTxy) {
                 diagramWidget->setAxisLabels(
                     firstComponentAxis,
@@ -1041,7 +1909,7 @@ int main(int argc, char *argv[])
 
                 diagramWidget->clearDiagram(
                     "Параметры диаграммы T–x–y заданы.\n"
-                    "Расчёт будет доступен после подключения функции напарника."
+                    "Нажмите «Рассчитать»."
                 );
             } else if (isPxy) {
                 diagramWidget->setAxisLabels(
@@ -1053,7 +1921,7 @@ int main(int argc, char *argv[])
 
                 diagramWidget->clearDiagram(
                     "Параметры диаграммы P–x–y заданы.\n"
-                    "Расчёт будет доступен после подключения функции напарника."
+                    "Нажмите «Рассчитать»."
                 );
             } else {
                 diagramWidget->clearDiagram(
@@ -1062,27 +1930,22 @@ int main(int argc, char *argv[])
                 );
             }
 
-            const bool supportedMixture =
-                mixture == "ETHANOL_WATER";
+            diagramWidget->setAzeotrope(0.0, 0.0, false);
 
-            modelCombo->setEnabled(supportedMixture);
-            calculateButton->setEnabled(supportedMixture);
+            tableLabel->setVisible(!isPoint);
+            resultTable->setVisible(!isPoint);
+            resultTable->clear();
+            resultTable->setRowCount(0);
+            resultTable->setColumnCount(0);
 
-            if (!supportedMixture) {
-                diagramWidget->clearDiagram(
-                    "Расчёт смеси ацетон – хлороформ пока не подключён."
-                );
-
-                resultLabel->setText(
-                    "Для выбранной смеси расчётный модуль пока не реализован."
-                );
-            } else {
-                resultLabel->setText(
-                    "Результат расчёта появится здесь."
-                );
-            }
+            exportDiagramButton->setEnabled(false);
 
             hasCalculation = false;
+            hasDiagram = false;
+
+            resultLabel->setText(
+                "Результат расчёта появится здесь."
+            );
         };
 
         // Реакция на изменение типа расчёта
@@ -1107,13 +1970,43 @@ int main(int argc, char *argv[])
 
         updateCalculationInterface();
 
+        // Обновление только границ осей: рассчитанная диаграмма
+        // при этом не сбрасывается.
+        auto updateAxisRange = [&]() {
+            if (!hasDiagram) {
+                return;
+            }
+
+            const QString mixture =
+                mixtureCombo->currentData().toString();
+
+            const QString axisLabel =
+                "Мольная доля " + firstComponentName(mixture);
+
+            if (lastDiagram.kind == "TXY") {
+                diagramWidget->setAxisLabels(
+                    axisLabel,
+                    "Температура, K",
+                    temperatureMin->value(),
+                    temperatureMax->value()
+                );
+            } else {
+                diagramWidget->setAxisLabels(
+                    axisLabel,
+                    "Давление, Pa",
+                    pressureMin->value(),
+                    pressureMax->value()
+                );
+            }
+        };
+
         // Обновляем границы осей при изменении диапазонов.
         QObject::connect(
             temperatureMin,
             qOverload<double>(&QDoubleSpinBox::valueChanged),
             &window,
-            [updateCalculationInterface](double) {
-                updateCalculationInterface();
+            [updateAxisRange](double) {
+                updateAxisRange();
             }
         );
 
@@ -1121,8 +2014,8 @@ int main(int argc, char *argv[])
             temperatureMax,
             qOverload<double>(&QDoubleSpinBox::valueChanged),
             &window,
-            [updateCalculationInterface](double) {
-                updateCalculationInterface();
+            [updateAxisRange](double) {
+                updateAxisRange();
             }
         );
 
@@ -1130,8 +2023,8 @@ int main(int argc, char *argv[])
             pressureMin,
             qOverload<double>(&QDoubleSpinBox::valueChanged),
             &window,
-            [updateCalculationInterface](double) {
-                updateCalculationInterface();
+            [updateAxisRange](double) {
+                updateAxisRange();
             }
         );
 
@@ -1139,8 +2032,8 @@ int main(int argc, char *argv[])
             pressureMax,
             qOverload<double>(&QDoubleSpinBox::valueChanged),
             &window,
-            [updateCalculationInterface](double) {
-                updateCalculationInterface();
+            [updateAxisRange](double) {
+                updateAxisRange();
             }
         );
 
@@ -1156,15 +2049,8 @@ int main(int argc, char *argv[])
                 const QString selectedMode =
                     calculationTypeCombo->currentData().toString();
 
-                // Проверяем выбранную смесь
-                if (selectedMixture != "ETHANOL_WATER") {
-                    QMessageBox::information(
-                        &window,
-                        "Расчёт пока недоступен",
-                        "Расчёт смеси ацетон – хлороформ пока не подключён."
-                    );
-                    return;
-                }
+                const QString selectedModel =
+                    modelCombo->currentData().toString();
 
                 // Проверяем корректность диапазонов диаграмм.
                 if (selectedMode == "TXY"
@@ -1187,39 +2073,29 @@ int main(int argc, char *argv[])
                     return;
                 }
 
-                // Пока поддерживается только расчёт одной точки.
-                // Поля диапазонов и число точек уже подготовлены для функций напарника.
-                if (selectedMode != "POINT") {
-                    QMessageBox::information(
-                        &window,
-                        "Расчёт диаграммы",
-                        "Параметры диапазона и количество точек заданы в форме. "
-                        "Расчёт диаграмм будет подключён после готовности функций напарника."
-                    );
-                    return;
-                }
-
-                // Проверяем выбранную модель
-                if (modelCombo->currentData().toString() == "UNIFAC_PR") {
-                    QMessageBox::information(
-                        &window,
-                        "Модель пока недоступна",
-                        "Расчёт UNIFAC + Peng–Robinson пока не подключён к интерфейсу."
-                    );
-                    return;
-                }
-
                 try {
+                    QApplication::setOverrideCursor(Qt::WaitCursor);
+
+                    if (selectedMode == "POINT") {
+                    const QString firstComponent =
+                        firstComponentName(selectedMixture);
+                    const QString secondComponent =
+                        secondComponentName(selectedMixture);
+
                     // Вызываем Python-функцию
-                    py::dict result = calc.attr("calculate_pr")(
+                    py::dict result = calc.attr("calculate_point")(
                         temperature->value(),
                         pressure->value(),
-                        composition->value()
+                        composition->value(),
+                        selectedMixture.toStdString(),
+                        selectedModel.toStdString()
                     ).cast<py::dict>();
 
                     lastResult = CalculationResult{};
 
-                    lastResult.model = "Peng–Robinson (phi–phi)";
+                    lastResult.mixture = selectedMixture;
+                    lastResult.modelCode = selectedModel;
+                    lastResult.model = modelDisplayName(selectedModel);
 
                     lastResult.temperature =
                         py::float_(result["temperature_K"]).cast<double>();
@@ -1287,7 +2163,12 @@ liquid = liquidObj.cast<py::list>();
                     QString output;
 
                     output +=
-                        "Модель: Peng–Robinson (phi–phi)\n";
+                        "Смесь: "
+                        + mixtureDisplayName(selectedMixture)
+                        + "\n";
+
+                    output +=
+                        "Модель: " + lastResult.model + "\n";
 
                     output +=
                         "Температура: "
@@ -1308,13 +2189,13 @@ liquid = liquidObj.cast<py::list>();
                         + " Pa\n";
 
                     output +=
-                        "Исходный состав: этанол = "
+                        "Исходный состав: " + firstComponent + " = "
                         + QString::number(
                             lastResult.feedEthanol,
                             'f',
                             4
                         )
-                        + ", вода = "
+                        + ", " + secondComponent + " = "
                         + QString::number(
                             lastResult.feedWater,
                             'f',
@@ -1329,13 +2210,13 @@ liquid = liquidObj.cast<py::list>();
 
                     if (lastResult.hasLiquid) {
                         output +=
-                            "Жидкая фаза: этанол = "
+                            "Жидкая фаза: " + firstComponent + " = "
                             + QString::number(
                                 lastResult.liquidEthanol,
                                 'f',
                                 5
                             )
-                            + ", вода = "
+                            + ", " + secondComponent + " = "
                             + QString::number(
                                 lastResult.liquidWater,
                                 'f',
@@ -1346,13 +2227,13 @@ liquid = liquidObj.cast<py::list>();
 
                     if (lastResult.hasVapor) {
                         output +=
-                            "Паровая фаза: этанол = "
+                            "Паровая фаза: " + firstComponent + " = "
                             + QString::number(
                                 lastResult.vaporEthanol,
                                 'f',
                                 5
                             )
-                            + ", вода = "
+                            + ", " + secondComponent + " = "
                             + QString::number(
                                 lastResult.vaporWater,
                                 'f',
@@ -1374,14 +2255,310 @@ liquid = liquidObj.cast<py::list>();
 
                     resultLabel->setText(output);
 
-                    // Для одной точки полноценная диаграмма не строится
+                    hasDiagram = false;
+                    exportDiagramButton->setEnabled(false);
+
                     diagramWidget->clearDiagram(
                         "Расчёт одной точки выполнен.\n"
-                        "Для построения T–x–y или P–x–y нужны массивы равновесных точек."
+                        "Для построения T–x–y или P–x–y выберите "
+                        "соответствующий режим."
                     );
+                    diagramWidget->setAzeotrope(0.0, 0.0, false);
+
+                    resultTable->clear();
+                    resultTable->setRowCount(0);
+                    resultTable->setColumnCount(0);
+
+                    } else {
+                        py::dict result;
+
+                        if (selectedMode == "TXY") {
+                            result = calc.attr("calculate_txy")(
+                                temperatureMin->value(),
+                                temperatureMax->value(),
+                                pressure->value(),
+                                pointCount->value(),
+                                selectedMixture.toStdString(),
+                                selectedModel.toStdString()
+                            ).cast<py::dict>();
+                        } else {
+                            result = calc.attr("calculate_pxy")(
+                                temperature->value(),
+                                pressureMin->value(),
+                                pressureMax->value(),
+                                pointCount->value(),
+                                selectedMixture.toStdString(),
+                                selectedModel.toStdString()
+                            ).cast<py::dict>();
+                        }
+
+                        py::list x1List = result["x1"].cast<py::list>();
+                        py::list y1List = result["y1"].cast<py::list>();
+
+                        const char *valuesKey =
+                            selectedMode == "TXY"
+                                ? "temperature_K"
+                                : "pressure_Pa";
+
+                        py::list valuesList =
+                            result[valuesKey].cast<py::list>();
+
+                        lastDiagram = DiagramResult{};
+                        lastDiagram.kind = selectedMode;
+                        lastDiagram.mixture = selectedMixture;
+                        lastDiagram.model = selectedModel;
+
+                        if (selectedMode == "TXY") {
+                            lastDiagram.pressure = pressure->value();
+                        } else {
+                            lastDiagram.temperature = temperature->value();
+                        }
+
+                        const int count =
+                            static_cast<int>(x1List.size());
+
+                        QVector<QPointF> liquidCurve;
+                        QVector<QPointF> vaporCurve;
+
+                        for (int index = 0; index < count; ++index) {
+                            const double x = py::float_(
+                                x1List[index]
+                            ).cast<double>();
+
+                            const double y = py::float_(
+                                y1List[index]
+                            ).cast<double>();
+
+                            const double value = py::float_(
+                                valuesList[index]
+                            ).cast<double>();
+
+                            lastDiagram.x1 << x;
+                            lastDiagram.y1 << y;
+                            lastDiagram.values << value;
+
+                            liquidCurve << QPointF(x, value);
+                            vaporCurve << QPointF(y, value);
+                        }
+
+                        py::object azeotropeObject =
+                            result["azeotrope"];
+
+                        if (!azeotropeObject.is_none()) {
+                            py::dict azeotrope =
+                                azeotropeObject.cast<py::dict>();
+
+                            const char *azeotropeKey =
+                                selectedMode == "TXY"
+                                    ? "temperature_K"
+                                    : "pressure_Pa";
+
+                            lastDiagram.hasAzeotrope = true;
+
+                            lastDiagram.azeotropeX1 = py::float_(
+                                azeotrope["x1"]
+                            ).cast<double>();
+
+                            lastDiagram.azeotropeValue = py::float_(
+                                azeotrope[azeotropeKey]
+                            ).cast<double>();
+                        }
+
+                        hasDiagram = true;
+                        hasCalculation = false;
+
+                        exportDiagramButton->setEnabled(true);
+
+                        const QString firstComponentAxis =
+                            "Мольная доля "
+                            + firstComponentName(selectedMixture);
+
+                        // Подбираем диапазон оси под расчётные данные,
+                        // чтобы кривые не терялись на широком интервале.
+                        double dataMin = lastDiagram.values.first();
+                        double dataMax = dataMin;
+
+                        for (double value : lastDiagram.values) {
+                            dataMin = std::min(dataMin, value);
+                            dataMax = std::max(dataMax, value);
+                        }
+
+                        const double dataSpan = dataMax - dataMin;
+                        const double padding = dataSpan > 0.0
+                            ? dataSpan * 0.05
+                            : (selectedMode == "TXY" ? 1.0 : 1000.0);
+
+                        if (selectedMode == "TXY") {
+                            QSignalBlocker minBlocker(temperatureMin);
+                            QSignalBlocker maxBlocker(temperatureMax);
+
+                            temperatureMin->setValue(dataMin - padding);
+                            temperatureMax->setValue(dataMax + padding);
+
+                            diagramWidget->setAxisLabels(
+                                firstComponentAxis,
+                                "Температура, K",
+                                temperatureMin->value(),
+                                temperatureMax->value()
+                            );
+                        } else {
+                            QSignalBlocker minBlocker(pressureMin);
+                            QSignalBlocker maxBlocker(pressureMax);
+
+                            pressureMin->setValue(dataMin - padding);
+                            pressureMax->setValue(dataMax + padding);
+
+                            diagramWidget->setAxisLabels(
+                                firstComponentAxis,
+                                "Давление, Pa",
+                                pressureMin->value(),
+                                pressureMax->value()
+                            );
+                        }
+
+                        diagramWidget->setCurves(
+                            liquidCurve,
+                            vaporCurve
+                        );
+
+                        diagramWidget->setAzeotrope(
+                            lastDiagram.azeotropeX1,
+                            lastDiagram.azeotropeValue,
+                            lastDiagram.hasAzeotrope
+                        );
+
+                        const QString valueHeader =
+                            selectedMode == "TXY"
+                                ? "T, K"
+                                : "P, Pa";
+
+                        resultTable->clear();
+                        resultTable->setColumnCount(3);
+                        resultTable->setHorizontalHeaderLabels({
+                            "x1 (жидкость)",
+                            "y1 (пар)",
+                            valueHeader
+                        });
+                        resultTable->setRowCount(count);
+
+                        for (int index = 0; index < count; ++index) {
+                            resultTable->setItem(
+                                index,
+                                0,
+                                new QTableWidgetItem(
+                                    QString::number(
+                                        lastDiagram.x1[index],
+                                        'f',
+                                        5
+                                    )
+                                )
+                            );
+
+                            resultTable->setItem(
+                                index,
+                                1,
+                                new QTableWidgetItem(
+                                    QString::number(
+                                        lastDiagram.y1[index],
+                                        'f',
+                                        5
+                                    )
+                                )
+                            );
+
+                            resultTable->setItem(
+                                index,
+                                2,
+                                new QTableWidgetItem(
+                                    QString::number(
+                                        lastDiagram.values[index],
+                                        'f',
+                                        selectedMode == "TXY" ? 3 : 1
+                                    )
+                                )
+                            );
+                        }
+
+                        resultTable->horizontalHeader()
+                            ->setSectionResizeMode(
+                                QHeaderView::Stretch
+                            );
+
+                        QString output;
+
+                        output += "Смесь: "
+                            + mixtureDisplayName(selectedMixture)
+                            + "\n";
+
+                        output += "Модель: "
+                            + modelDisplayName(selectedModel)
+                            + "\n";
+
+                        output += "Диаграмма: "
+                            + diagramKindName(selectedMode)
+                            + "\n";
+
+                        if (selectedMode == "TXY") {
+                            output += "Давление: "
+                                + QString::number(
+                                    lastDiagram.pressure,
+                                    'f',
+                                    0
+                                )
+                                + " Pa\n";
+                        } else {
+                            output += "Температура: "
+                                + QString::number(
+                                    lastDiagram.temperature,
+                                    'f',
+                                    2
+                                )
+                                + " K\n";
+                        }
+
+                        output += "Точек: "
+                            + QString::number(count)
+                            + "\n";
+
+                        if (lastDiagram.hasAzeotrope) {
+                            output += "Азеотроп: x1 = "
+                                + QString::number(
+                                    lastDiagram.azeotropeX1,
+                                    'f',
+                                    5
+                                );
+
+                            if (selectedMode == "TXY") {
+                                output += ", T = "
+                                    + QString::number(
+                                        lastDiagram.azeotropeValue,
+                                        'f',
+                                        3
+                                    )
+                                    + " K";
+                            } else {
+                                output += ", P = "
+                                    + QString::number(
+                                        lastDiagram.azeotropeValue,
+                                        'f',
+                                        0
+                                    )
+                                    + " Pa";
+                            }
+                        } else {
+                            output += "Азеотропная точка не найдена.";
+                        }
+
+                        resultLabel->setText(output);
+                    }
+
+                    QApplication::restoreOverrideCursor();
 
                 } catch (const py::error_already_set &error) {
+                    QApplication::restoreOverrideCursor();
                     hasCalculation = false;
+                    hasDiagram = false;
+                    exportDiagramButton->setEnabled(false);
 
                     QMessageBox::critical(
                         &window,
@@ -1390,7 +2567,10 @@ liquid = liquidObj.cast<py::list>();
                     );
 
                 } catch (const std::exception &error) {
+                    QApplication::restoreOverrideCursor();
                     hasCalculation = false;
+                    hasDiagram = false;
+                    exportDiagramButton->setEnabled(false);
 
                     QMessageBox::critical(
                         &window,
@@ -1407,6 +2587,26 @@ liquid = liquidObj.cast<py::list>();
             &QPushButton::clicked,
             &window,
             [&]() {
+                if (hasDiagram) {
+                    QString errorMessage;
+
+                    if (!saveDiagram(db, lastDiagram, errorMessage)) {
+                        QMessageBox::critical(
+                            &window,
+                            "Ошибка сохранения",
+                            errorMessage
+                        );
+                        return;
+                    }
+
+                    QMessageBox::information(
+                        &window,
+                        "Сохранение",
+                        "Диаграмма успешно сохранена в истории диаграмм."
+                    );
+                    return;
+                }
+
                 if (!hasCalculation) {
                     QMessageBox::warning(
                         &window,
@@ -1435,13 +2635,42 @@ liquid = liquidObj.cast<py::list>();
             }
         );
 
-        // Кнопка просмотра истории
+        // Кнопка экспорта текущей диаграммы
+        QObject::connect(
+            exportDiagramButton,
+            &QPushButton::clicked,
+            &window,
+            [&]() {
+                if (!hasDiagram) {
+                    QMessageBox::warning(
+                        &window,
+                        "Нет диаграммы",
+                        "Сначала выполните расчёт диаграммы."
+                    );
+                    return;
+                }
+
+                exportDiagramToCsv(lastDiagram, &window);
+            }
+        );
+
+        // Кнопка просмотра истории расчётов
         QObject::connect(
             historyButton,
             &QPushButton::clicked,
             &window,
             [&]() {
                 showHistory(db, &window);
+            }
+        );
+
+        // Кнопка просмотра истории диаграмм
+        QObject::connect(
+            diagramHistoryButton,
+            &QPushButton::clicked,
+            &window,
+            [&]() {
+                showDiagramHistory(db, &window);
             }
         );
 

@@ -23,8 +23,19 @@ target_link_libraries(VLEStudio PRIVATE
     pybind11::embed
 )
 
+if(WIN32)
+    set(VLE_PYTHON_SITE_PACKAGES "${CMAKE_SOURCE_DIR}/.venv/Lib/site-packages")
+else()
+    set(VLE_PYTHON_SITE_PACKAGES "${CMAKE_SOURCE_DIR}/.venv/lib/python3.12/site-packages")
+endif()
+
 target_compile_definitions(VLEStudio PRIVATE
     QT_NO_KEYWORDS
-    VLE_PYTHON_SITE_PACKAGES="${CMAKE_SOURCE_DIR}/.venv/lib/python3.12/site-packages"
+    VLE_PYTHON_SITE_PACKAGES="${VLE_PYTHON_SITE_PACKAGES}"
     VLE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
+
+if(MSVC)
+    # Исходники в UTF-8 без BOM: без этого флага MSVC читает строки в кодировке системы.
+    target_compile_options(VLEStudio PRIVATE /utf-8)
+endif()

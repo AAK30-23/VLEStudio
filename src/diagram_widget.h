@@ -29,6 +29,9 @@ public:
         const QVector<QPointF> &vaporCurve
     );
 
+    // Отмечает азеотропную точку на диаграмме
+    void setAzeotrope(double x, double y, bool visible);
+
     // Очищает график
     void clearDiagram(const QString &message);
 
@@ -45,6 +48,9 @@ private:
 
     QVector<QPointF> liquidPoints;
     QVector<QPointF> vaporPoints;
+
+    bool hasAzeotrope;
+    QPointF azeotropePoint;
 
     bool hasData;
 };

@@ -13,6 +13,7 @@ DiagramWidget::DiagramWidget(QWidget *parent)
       emptyMessage("Расчётные данные пока не загружены"),
       yMinimum(0.0),
       yMaximum(1.0),
+      hasAzeotrope(false),
       hasData(false)
 {
     setMinimumSize(550, 350);
@@ -58,8 +59,17 @@ void DiagramWidget::clearDiagram(const QString &message)
     liquidPoints.clear();
     vaporPoints.clear();
 
+    hasAzeotrope = false;
     hasData = false;
     emptyMessage = message;
+
+    update();
+}
+
+void DiagramWidget::setAzeotrope(double x, double y, bool visible)
+{
+    hasAzeotrope = visible;
+    azeotropePoint = QPointF(x, y);
 
     update();
 }
@@ -243,6 +253,7 @@ void DiagramWidget::paintEvent(QPaintEvent *event)
             path.lineTo(transformPoint(points[i]));
         }
 
+        painter.setBrush(Qt::NoBrush);
         painter.setPen(QPen(color, 2.5));
         painter.drawPath(path);
 
@@ -259,8 +270,22 @@ void DiagramWidget::paintEvent(QPaintEvent *event)
         }
     };
 
+    painter.save();
+    painter.setClipRect(plotArea);
+
     drawCurve(liquidPoints, QColor(40, 110, 210));
     drawCurve(vaporPoints, QColor(220, 90, 50));
+
+    // Азеотропная точка
+    if (hasAzeotrope) {
+        QPointF point = transformPoint(azeotropePoint);
+
+        painter.setBrush(QColor(30, 30, 30));
+        painter.setPen(QPen(Qt::white, 2));
+        painter.drawEllipse(point, 6.0, 6.0);
+    }
+
+    painter.restore();
 
     // Легенда
     int legendX = plotArea.left() + 15;
@@ -288,4 +313,21 @@ void DiagramWidget::paintEvent(QPaintEvent *event)
         legendY + 27,
         "Паровая фаза"
     );
+
+    if (hasAzeotrope) {
+        painter.setBrush(QColor(30, 30, 30));
+        painter.setPen(QPen(Qt::white, 1.5));
+        painter.drawEllipse(
+            QPointF(legendX + 12, legendY + 45),
+            5.0,
+            5.0
+        );
+
+        painter.setPen(Qt::black);
+        painter.drawText(
+            legendX + 32,
+            legendY + 49,
+            "Азеотроп"
+        );
+    }
 }
